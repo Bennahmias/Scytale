@@ -1,57 +1,95 @@
 import os
-import requests
 import json
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
+from typing import List
+from urllib.parse import urlparse, parse_qs
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 
 load_dotenv()
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-REPO = "EddieHubCommunity/awesome-github-profiles"
+if not GITHUB_TOKEN:
+    raise RuntimeError("Please set GITHUB_TOKEN env var before running")
 
-headers = {
-    "Authorization": f"token {GITHUB_TOKEN}",
-    "Accept": "application/vnd.github+json"
-}
+REPO      = "Scytale-exercise/scytale-repo3"
+PER_PAGE  = 100
+API_URL   = f"https://api.github.com/repos/{REPO}/pulls"
+OUTPUT    = "data/raw.json"
+PARALLEL  = 20 
 
-# Fetch one page of closed PRs and filter merged ones
-def fetch_page(repo, page):
-    try:
-        url = f"https://api.github.com/repos/{repo}/pulls"
-        params = {"state": "closed", "per_page": 100, "page": page}
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        response.raise_for_status()
-        prs = response.json()
-        return [pr for pr in prs if pr.get("merged_at") is not None]
-    except Exception as e:
-        print(f"⚠️ Error fetching page {page}: {e}")
+
+def get_retrying_session() -> requests.Session:
+    session = requests.Session()
+    retries = Retry(
+        total=5,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("https://", adapter)
+    session.headers.update({
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept":        "application/vnd.github+json",
+    })
+    return session
+
+# Find last page via Link header 
+
+def discover_last_page(session: requests.Session) -> int:
+    resp = session.get(API_URL, params={"state":"closed", "per_page":PER_PAGE, "page":1}, timeout=10)
+    resp.raise_for_status()
+    link = resp.headers.get("Link", "")
+    # if no Link header, there’s only this one page
+    if 'rel="last"' not in link:
+        return 1 if resp.json() else 0
+    for part in link.split(","):
+        if 'rel="last"' in part:
+            # extract the URL and parse the page number from it [1:-1] removes the <>
+            url = part.split(";")[0].strip()[1:-1]
+            return int(parse_qs(urlparse(url).query)["page"][0])
+    return 1
+
+# Fetch one page and return only merged PRs 
+def fetch_page(session: requests.Session, page: int) -> List[dict]:
+    resp = session.get(
+        API_URL,
+        params={"state":"closed", "per_page":PER_PAGE, "page":page},
+        timeout=10
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return [pr for pr in data if pr.get("merged_at")]
+
+# Fetch all the treads to one list of merged PRs
+def fetch_all_merged_prs(parallel: int = PARALLEL) -> List[dict]:
+    session = get_retrying_session()
+    last_page = discover_last_page(session)
+    if last_page == 0:
         return []
 
-# Fetch all pages in parallel
-def fetch_all_merged_prs(repo, max_pages=500, batch_size=10):
-    merged_prs = []
-    page = 1
-    while page <= max_pages:
-        with ThreadPoolExecutor(max_workers=batch_size) as executor:
-            futures = {executor.submit(fetch_page, repo, p): p for p in range(page, page + batch_size)}
-            batch_results = []
-            for future in as_completed(futures):
-                prs = future.result()
-                if prs:
-                    batch_results.extend(prs)
-        if not batch_results:
-            break
-        merged_prs.extend(batch_results)
-        page += batch_size
-    return merged_prs
+    print(f"Detected {last_page} pages of closed PRs; fetching up to {last_page * PER_PAGE} items…")
+
+    merged: List[dict] = []
+    with ThreadPoolExecutor(max_workers=parallel) as exe:
+        futures = {exe.submit(fetch_page, session, pg): pg for pg in range(1, last_page+1)}
+        for fut in as_completed(futures):
+            pg = futures[fut]
+            try:
+                prs = fut.result()
+                merged.extend(prs)
+            except Exception as e:
+                print(f"Error on page {pg}: {e}")
+
+    return merged
 
 
 if __name__ == "__main__":
-    start = time.time()
-    os.makedirs("data", exist_ok=True)
-    prs = fetch_all_merged_prs(REPO)
-    with open("data/raw.json", "w") as f:
-        json.dump(prs, f, indent=2)
-    duration = time.time() - start
-    print(f"✅ Saved {len(prs)} merged PRs to data/raw.json")
-    print(f"⏱️ Done in {duration:.2f} seconds.")
+    os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)
+
+    all_prs = fetch_all_merged_prs()
+    with open(OUTPUT, "w", encoding="utf-8") as f:
+        json.dump(all_prs, f, indent=2)
