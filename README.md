@@ -30,7 +30,7 @@ Export both raw JSON data and a Parquet summary for further analysis.
 1. **Clone the repository**
 
    ```sh
-   git clone <https://github.com/Bennahmias/Scytale>
+   git clone <https://github.com/Bennahmias/Scytale.git>
    cd Scytale
    ```
 
